@@ -1,5 +1,11 @@
-template-repository (1.0-1) unstable; urgency=medium
+libliftoff (0.3.0-1) unstable; urgency=medium
 
-  * Initial release
+  * New upstream version 0.3.0
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Stephan Lachnit <stephanlachnit@debian.org>  Thu, 18 Aug 2022 10:45:20 +0200
+
+libliftoff (0.2.0-1) unstable; urgency=medium
+
+  * Initial release (Closes: #989101)
+
+ -- Stephan Lachnit <stephanlachnit@debian.org>  Tue, 05 Jul 2022 14:59:00 +0200
