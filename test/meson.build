@@ -54,6 +54,7 @@ tests = {
 	'dynamic': [
 		'same',
 		'change-fb',
+		'change-fb-modifier',
 		'unset-fb',
 		'set-fb',
 		'add-layer',
@@ -77,6 +78,14 @@ tests = {
 		'immutable-zpos',
 		'unmatched',
 		'unset',
+		'in-formats',
+		'range',
+		'signed-range',
+		'enum',
+		'bitmask',
+	],
+	'candidate': [
+		'basic',
 	],
 }
 

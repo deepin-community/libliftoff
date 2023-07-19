@@ -1,7 +1,7 @@
 project(
 	'libliftoff',
 	'c',
-	version: '0.3.0',
+	version: '0.4.1',
 	license: 'MIT',
 	meson_version: '>=0.52.0',
 	default_options: [
@@ -17,6 +17,9 @@ add_project_arguments(cc.get_supported_arguments([
 	'-Wundef',
 	'-Wmissing-prototypes',
 	'-Walloca',
+	'-Wdeclaration-after-statement',
+	'-Wfloat-conversion',
+	'-Wsign-conversion',
 
 	'-Wno-missing-braces',
 	'-Wno-unused-parameter',
@@ -24,7 +27,7 @@ add_project_arguments(cc.get_supported_arguments([
 
 liftoff_inc = include_directories('include')
 
-drm = dependency('libdrm', include_type: 'system')
+drm = dependency('libdrm', include_type: 'system', version: '>= 2.4.108')
 
 liftoff_deps = [drm]
 
@@ -51,15 +54,19 @@ liftoff = declare_dependency(
 	dependencies: liftoff_deps,
 )
 
+if meson.version().version_compare('>= 0.54.0')
+	meson.override_dependency('libliftoff', liftoff)
+endif
+
 install_headers('include/libliftoff.h')
 
 pkgconfig = import('pkgconfig')
 pkgconfig.generate(
 	liftoff_lib,
-	version: meson.project_version(),
 	filebase: meson.project_name(),
 	name: meson.project_name(),
 	description: 'KMS plane library',
+	url: 'https://gitlab.freedesktop.org/emersion/libliftoff',
 )
 
 subdir('example')

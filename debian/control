@@ -1,7 +1,7 @@
 Source: libliftoff
 Section: libs
 Priority: optional
-Maintainer: Stephan Lachnit <stephanlachnit@debian.org>
+Maintainer: xiangzelong <xiangzelong@deepin.org>
 Build-Depends:
  debhelper-compat (= 13),
  meson,
@@ -10,8 +10,8 @@ Build-Depends:
 Rules-Requires-Root: no
 Standards-Version: 4.6.1
 Homepage: https://gitlab.freedesktop.org/emersion/libliftoff
-Vcs-Browser: https://salsa.debian.org/debian/libliftoff
-Vcs-Git: https://salsa.debian.org/debian/libliftoff.git
+Vcs-Browser: https://github.com/deepin-community/libliftoff
+Vcs-Git: https://github.com/deepin-community/libliftoff.git
 
 Package: libliftoff0
 Architecture: any
