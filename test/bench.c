@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200112L
 #include <assert.h>
 #include <libliftoff.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -67,6 +68,7 @@ main(int argc, char *argv[])
 	}
 
 	liftoff_log_set_priority(LIFTOFF_SILENT);
+	liftoff_mock_verbose = false;
 
 	for (i = 0; i < planes_len; i++) {
 		plane_type = i == 0 ? DRM_PLANE_TYPE_PRIMARY :
@@ -103,7 +105,9 @@ main(int argc, char *argv[])
 	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	req = drmModeAtomicAlloc();
-	ret = liftoff_output_apply(output, req, 0);
+	ret = liftoff_output_apply(output, req, 0, &(struct liftoff_output_apply_options){
+		.timeout_ns = INT64_MAX,
+	});
 	assert(ret == 0);
 	drmModeAtomicFree(req);
 
