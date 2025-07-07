@@ -1,9 +1,11 @@
+#define _POSIX_C_SOURCE 200112L
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "log.h"
 #include "private.h"
@@ -76,6 +78,9 @@ struct alloc_result {
 	struct liftoff_layer **best;
 	int best_score;
 
+	struct timespec started_at;
+	int64_t timeout_ns;
+
 	/* per-output */
 	bool has_composition_layer;
 	size_t non_composition_layers_len;
@@ -95,6 +100,29 @@ struct alloc_step {
 
 	char log_prefix[64];
 };
+
+static const int64_t NSEC_PER_SEC = 1000 * 1000 * 1000;
+
+static int64_t
+timespec_to_nsec(struct timespec ts)
+{
+	return (int64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+}
+
+static const int64_t DEFAULT_ALLOC_TIMEOUT_NSEC = 1000 * 1000; // 1ms
+
+static bool
+check_deadline(struct timespec start, int64_t timeout_ns)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+		liftoff_log_errno(LIFTOFF_ERROR, "clock_gettime");
+		return false;
+	}
+
+	return timespec_to_nsec(now) - timeout_ns < timespec_to_nsec(start);
+}
 
 static void
 plane_step_init_next(struct alloc_step *step, struct alloc_step *prev,
@@ -126,7 +154,7 @@ plane_step_init_next(struct alloc_step *step, struct alloc_step *prev,
 
 	zpos_prop = NULL;
 	if (layer != NULL) {
-		zpos_prop = layer_get_property(layer, "zpos");
+		zpos_prop = layer_get_core_property(layer, LIFTOFF_PROP_ZPOS);
 	}
 	if (zpos_prop != NULL && plane->type != DRM_PLANE_TYPE_PRIMARY) {
 		step->last_layer_zpos = zpos_prop->value;
@@ -176,7 +204,7 @@ has_composited_layer_over(struct liftoff_output *output,
 	struct liftoff_layer *other_layer;
 	struct liftoff_layer_property *zpos_prop, *other_zpos_prop;
 
-	zpos_prop = layer_get_property(layer, "zpos");
+	zpos_prop = layer_get_core_property(layer, LIFTOFF_PROP_ZPOS);
 	if (zpos_prop == NULL) {
 		return false;
 	}
@@ -186,7 +214,8 @@ has_composited_layer_over(struct liftoff_output *output,
 			continue;
 		}
 
-		other_zpos_prop = layer_get_property(other_layer, "zpos");
+		other_zpos_prop = layer_get_core_property(other_layer,
+							  LIFTOFF_PROP_ZPOS);
 		if (other_zpos_prop == NULL) {
 			continue;
 		}
@@ -209,7 +238,7 @@ has_allocated_layer_over(struct liftoff_output *output, struct alloc_step *step,
 	struct liftoff_layer *other_layer;
 	struct liftoff_layer_property *zpos_prop, *other_zpos_prop;
 
-	zpos_prop = layer_get_property(layer, "zpos");
+	zpos_prop = layer_get_core_property(layer, LIFTOFF_PROP_ZPOS);
 	if (zpos_prop == NULL) {
 		return false;
 	}
@@ -229,7 +258,8 @@ has_allocated_layer_over(struct liftoff_output *output, struct alloc_step *step,
 			continue;
 		}
 
-		other_zpos_prop = layer_get_property(other_layer, "zpos");
+		other_zpos_prop = layer_get_core_property(other_layer,
+							  LIFTOFF_PROP_ZPOS);
 		if (other_zpos_prop == NULL) {
 			continue;
 		}
@@ -292,7 +322,7 @@ check_layer_plane_compatible(struct alloc_step *step,
 		return false;
 	}
 
-	zpos_prop = layer_get_property(layer, "zpos");
+	zpos_prop = layer_get_core_property(layer, LIFTOFF_PROP_ZPOS);
 	if (zpos_prop != NULL) {
 		if ((int)zpos_prop->value > step->last_layer_zpos &&
 		    has_allocated_layer_over(output, step, layer)) {
@@ -387,6 +417,31 @@ check_alloc_valid(struct liftoff_output *output, struct alloc_result *result,
 	return true;
 }
 
+static bool
+check_plane_output_compatible(struct liftoff_plane *plane, struct liftoff_output *output)
+{
+	return (plane->possible_crtcs & (1 << output->crtc_index)) != 0;
+}
+
+static int
+count_remaining_compatible_planes(struct liftoff_output *output,
+				  struct alloc_step *step)
+{
+	struct liftoff_list *link;
+	struct liftoff_plane *plane;
+	int remaining = 0;
+
+	for (link = step->plane_link; link != &output->device->planes; link = link->next) {
+		plane = liftoff_container_of(link, plane, link);
+		if (plane->layer == NULL &&
+		    check_plane_output_compatible(plane, output)) {
+			remaining++;
+		}
+	}
+
+	return remaining;
+}
+
 static int
 output_choose_layers(struct liftoff_output *output, struct alloc_result *result,
 		     struct alloc_step *step)
@@ -395,7 +450,7 @@ output_choose_layers(struct liftoff_output *output, struct alloc_result *result,
 	struct liftoff_plane *plane;
 	struct liftoff_layer *layer;
 	int cursor, ret;
-	size_t remaining_planes;
+	int remaining_planes;
 	struct alloc_step next_step = {0};
 
 	device = output->device;
@@ -416,21 +471,16 @@ output_choose_layers(struct liftoff_output *output, struct alloc_result *result,
 
 	plane = liftoff_container_of(step->plane_link, plane, link);
 
-	remaining_planes = result->planes_len - step->plane_idx;
-	if (result->best_score >= step->score + (int)remaining_planes) {
+	remaining_planes = count_remaining_compatible_planes(output, step);
+	if (result->best_score >= step->score + remaining_planes) {
 		/* Even if we find a layer for all remaining planes, we won't
 		 * find a better allocation. Give up. */
-		/* TODO: change remaining_planes to only count those whose
-		 * possible CRTC match and which aren't allocated */
 		return 0;
 	}
 
 	cursor = drmModeAtomicGetCursor(result->req);
 
-	if (plane->layer != NULL) {
-		goto skip;
-	}
-	if ((plane->possible_crtcs & (1 << output->crtc_index)) == 0) {
+	if (plane->layer != NULL || !check_plane_output_compatible(plane, output)) {
 		goto skip;
 	}
 
@@ -447,6 +497,12 @@ output_choose_layers(struct liftoff_output *output, struct alloc_result *result,
 		}
 		if (!check_layer_plane_compatible(step, layer, plane)) {
 			continue;
+		}
+
+		if (!check_deadline(result->started_at, result->timeout_ns)) {
+			liftoff_log(LIFTOFF_DEBUG, "%s Deadline exceeded",
+				    step->log_prefix);
+			break;
 		}
 
 		/* Try to use this layer for the current plane */
@@ -542,10 +598,37 @@ fb_info_needs_realloc(const drmModeFB2 *a, const drmModeFB2 *b)
 }
 
 static bool
-layer_needs_realloc(struct liftoff_layer *layer)
+layer_intersection_changed(struct liftoff_layer *this,
+			   struct liftoff_output *output)
 {
-	size_t i;
+	struct liftoff_layer *other;
+	struct liftoff_rect this_cur, this_prev, other_cur, other_prev;
+
+	layer_get_rect(this, &this_cur);
+	layer_get_prev_rect(this, &this_prev);
+	liftoff_list_for_each(other, &output->layers, link) {
+		if (this == other) {
+			continue;
+		}
+
+		layer_get_rect(other, &other_cur);
+		layer_get_prev_rect(other, &other_prev);
+
+		if (rect_intersects(&this_cur, &other_cur) !=
+		    rect_intersects(&this_prev, &other_prev)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+layer_needs_realloc(struct liftoff_layer *layer, struct liftoff_output *output)
+{
 	struct liftoff_layer_property *prop;
+	bool check_crtc_intersect = false;
+	size_t i;
 
 	if (layer->changed) {
 		liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
@@ -563,7 +646,7 @@ layer_needs_realloc(struct liftoff_layer *layer)
 		 * If FB_ID changes from non-zero to non-zero and the FB
 		 * attributes didn't change, we can try to re-use the previous
 		 * allocation. */
-		if (strcmp(prop->name, "FB_ID") == 0) {
+		if (prop->core_index == LIFTOFF_PROP_FB_ID) {
 			if (prop->value == 0 && prop->prev_value == 0) {
 				continue;
 			}
@@ -593,7 +676,7 @@ layer_needs_realloc(struct liftoff_layer *layer)
 		/* If the layer was or becomes completely transparent or
 		 * completely opaque, we might be able to find a better
 		 * allocation. Otherwise, we can keep the current one. */
-		if (strcmp(prop->name, "alpha") == 0) {
+		if (prop->core_index == LIFTOFF_PROP_ALPHA) {
 			if (prop->value == 0 || prop->prev_value == 0 ||
 			    prop->value == 0xFFFF || prop->prev_value == 0xFFFF) {
 				liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
@@ -610,14 +693,121 @@ layer_needs_realloc(struct liftoff_layer *layer)
 			continue;
 		}
 
-		/* TODO: if CRTC_{X,Y,W,H} changed but intersection with other
-		 * layers hasn't changed, don't realloc */
+		/* If CRTC_* changed, check for intersection later */
+		if (strcmp(prop->name, "CRTC_X") == 0 ||
+		    strcmp(prop->name, "CRTC_Y") == 0 ||
+		    strcmp(prop->name, "CRTC_W") == 0 ||
+		    strcmp(prop->name, "CRTC_H") == 0) {
+			check_crtc_intersect = true;
+			continue;
+		}
+
 		liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
 			    "property \"%s\" changed", prop->name);
 		return true;
 	}
 
+	if (check_crtc_intersect &&
+	    layer_intersection_changed(layer, output)) {
+		liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
+			    "intersection with other layer(s) changed");
+		return true;
+	}
+
 	return false;
+}
+
+static bool
+layer_is_higher_priority(struct liftoff_layer *this, struct liftoff_layer *other)
+{
+	struct liftoff_layer_property *this_zpos, *other_zpos;
+	bool this_visible, other_visible, intersects;
+
+	// The composition layer should be highest priority.
+	if (this->output->composition_layer == this) {
+		return true;
+	} else if (this->output->composition_layer == other) {
+		return false;
+	}
+
+	// Invisible layers are given lowest priority. Pass-thru if both have
+	// same visibility
+	this_visible = layer_is_visible(this);
+	other_visible = layer_is_visible(other);
+	if (this_visible != other_visible) {
+		return this_visible;
+	}
+
+	// A layer's overall priority is determined by a combination of it's
+	// current_priority, it's zpos, and whether it intersects with others.
+	//
+	// Consider two layers. If they do not intersect, the layer with higher
+	// priority is given overall priority. However if both layers have
+	// identical priority, then the layer with higher zpos is given overall
+	// priority.
+	//
+	// If the layers intersect, their zpos determines the overall priority.
+	// If their zpos are identical, then simply fallback to looking at
+	// current_priority. Otherwise, the layer with higher zpos is given
+	// overall priority, since the top layer needs to be offloaded in order
+	// to offload the bottom layer.
+
+	this_zpos = layer_get_core_property(this, LIFTOFF_PROP_ZPOS);
+	other_zpos = layer_get_core_property(other, LIFTOFF_PROP_ZPOS);
+	intersects = layer_intersects(this, other);
+
+	if (this_zpos != NULL && other_zpos != NULL) {
+		if (intersects) {
+			return this_zpos->value == other_zpos->value ?
+			       this->current_priority > other->current_priority :
+			       this_zpos->value > other_zpos->value;
+		} else {
+			return this->current_priority == other->current_priority ?
+			       this_zpos->value > other_zpos->value :
+			       this->current_priority > other->current_priority;
+		}
+	} else if (this_zpos == NULL && other_zpos == NULL) {
+		return this->current_priority > other->current_priority;
+	} else {
+		// Either this or other zpos is null
+		return this_zpos != NULL;
+	}
+}
+
+static bool
+update_layers_order(struct liftoff_output *output)
+{
+	struct liftoff_list *search, *max, *cur, *head;
+	struct liftoff_layer *this_layer, *other_layer;
+	bool order_changed = false;
+
+	head = &output->layers;
+	cur = head;
+
+	// Run a insertion sort to order layers by priority.
+	while (cur->next != head) {
+		cur = cur->next;
+
+		max = cur;
+		search = cur;
+		while (search->next != head) {
+			search = search->next;
+			this_layer = liftoff_container_of(search, this_layer, link);
+			other_layer = liftoff_container_of(max, other_layer, link);
+			if (layer_is_higher_priority(this_layer, other_layer)) {
+				max = search;
+			}
+		}
+
+		if (cur != max) {
+			liftoff_list_swap(cur, max);
+			// max is now where iterator cur was, relocate to continue
+			cur = max;
+			order_changed = true;
+		}
+	}
+
+	return order_changed;
 }
 
 static int
@@ -627,8 +817,11 @@ reuse_previous_alloc(struct liftoff_output *output, drmModeAtomicReq *req,
 	struct liftoff_device *device;
 	struct liftoff_layer *layer;
 	int cursor, ret;
+	bool layer_order_changed;
 
 	device = output->device;
+
+	layer_order_changed = update_layers_order(output);
 
 	if (output->layers_changed) {
 		liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
@@ -637,9 +830,15 @@ reuse_previous_alloc(struct liftoff_output *output, drmModeAtomicReq *req,
 	}
 
 	liftoff_list_for_each(layer, &output->layers, link) {
-		if (layer_needs_realloc(layer)) {
+		if (layer_needs_realloc(layer, output)) {
 			return -EINVAL;
 		}
+	}
+
+	if (layer_order_changed) {
+		liftoff_log(LIFTOFF_DEBUG, "Cannot re-use previous allocation: "
+			    "layer priority order changed.");
+		return -EINVAL;
 	}
 
 	cursor = drmModeAtomicGetCursor(req);
@@ -698,7 +897,8 @@ update_layers_fb_info(struct liftoff_output *output)
 	 * re-created a completely different one which happens to have the same
 	 * FB ID. */
 	liftoff_list_for_each(layer, &output->layers, link) {
-		memset(&layer->fb_info, 0, sizeof(layer->fb_info));
+		layer->fb_info = (drmModeFB2){0};
+
 		layer_cache_fb_info(layer);
 		/* TODO: propagate error? */
 	}
@@ -709,8 +909,8 @@ log_reuse(struct liftoff_output *output)
 {
 	if (output->alloc_reused_counter == 0) {
 		liftoff_log(LIFTOFF_DEBUG,
-			    "Reusing previous plane allocation on output %p",
-			    (void *)output);
+			    "Reusing previous plane allocation on output %"PRIu32,
+			    output->crtc_id);
 	}
 	output->alloc_reused_counter++;
 }
@@ -718,14 +918,14 @@ log_reuse(struct liftoff_output *output)
 static void
 log_no_reuse(struct liftoff_output *output)
 {
-	liftoff_log(LIFTOFF_DEBUG, "Computing plane allocation on output %p",
-		    (void *)output);
+	liftoff_log(LIFTOFF_DEBUG, "Computing plane allocation on output %"PRIu32,
+		    output->crtc_id);
 
 	if (output->alloc_reused_counter != 0) {
 		liftoff_log(LIFTOFF_DEBUG,
 			    "Stopped reusing previous plane allocation on "
-			    "output %p (had reused it %d times)",
-			    (void *)output, output->alloc_reused_counter);
+			    "output %"PRIu32" (had reused it %d times)",
+			    output->crtc_id, output->alloc_reused_counter);
 		output->alloc_reused_counter = 0;
 	}
 }
@@ -749,15 +949,22 @@ non_composition_layers_length(struct liftoff_output *output)
 
 int
 liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
-		     uint32_t flags)
+		     uint32_t flags,
+		     const struct liftoff_output_apply_options *options)
 {
 	struct liftoff_device *device;
 	struct liftoff_plane *plane;
 	struct liftoff_layer *layer;
 	struct alloc_result result = {0};
 	struct alloc_step step = {0};
+	const struct liftoff_output_apply_options default_options = {0};
 	size_t i, candidate_planes;
 	int ret;
+	bool found_layer;
+
+	if (options == NULL) {
+		options = &default_options;
+	}
 
 	device = output->device;
 
@@ -767,6 +974,7 @@ liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
 	ret = reuse_previous_alloc(output, req, flags);
 	if (ret == 0) {
 		log_reuse(output);
+		mark_layers_clean(output);
 		return 0;
 	}
 	log_no_reuse(output);
@@ -808,11 +1016,21 @@ liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
 	result.flags = flags;
 	result.planes_len = liftoff_list_length(&device->planes);
 
-	step.alloc = malloc(result.planes_len * sizeof(*step.alloc));
-	result.best = malloc(result.planes_len * sizeof(*result.best));
+	step.alloc = malloc(result.planes_len * sizeof(step.alloc[0]));
+	result.best = malloc(result.planes_len * sizeof(result.best[0]));
 	if (step.alloc == NULL || result.best == NULL) {
 		liftoff_log_errno(LIFTOFF_ERROR, "malloc");
 		return -ENOMEM;
+	}
+
+	if (clock_gettime(CLOCK_MONOTONIC, &result.started_at) != 0) {
+		liftoff_log_errno(LIFTOFF_ERROR, "clock_gettime");
+		return -errno;
+	}
+
+	result.timeout_ns = options->timeout_ns;
+	if (result.timeout_ns == 0) {
+		result.timeout_ns = DEFAULT_ALLOC_TIMEOUT_NSEC;
 	}
 
 	/* For each plane, try to find a layer. Don't do it the other
@@ -821,7 +1039,7 @@ liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
 	 * before any other plane. */
 
 	result.best_score = -1;
-	memset(result.best, 0, result.planes_len * sizeof(*result.best));
+	memset(result.best, 0, result.planes_len * sizeof(result.best[0]));
 	result.has_composition_layer = output->composition_layer != NULL;
 	result.non_composition_layers_len =
 		non_composition_layers_length(output);
@@ -838,12 +1056,14 @@ liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
 	}
 
 	liftoff_log(LIFTOFF_DEBUG,
-		    "Found plane allocation for output %p (score: %d, candidate planes: %zu, tests: %d):",
-		    (void *)output, result.best_score, candidate_planes,
+		    "Found plane allocation for output %"PRIu32" "
+		    "(score: %d, candidate planes: %zu, tests: %d):",
+		    output->crtc_id, result.best_score, candidate_planes,
 		    device->test_commit_counter);
 
 	/* Apply the best allocation */
 	i = 0;
+	found_layer = false;
 	liftoff_list_for_each(plane, &device->planes, link) {
 		layer = result.best[i];
 		i++;
@@ -858,8 +1078,10 @@ liftoff_output_apply(struct liftoff_output *output, drmModeAtomicReq *req,
 		assert(layer->plane == NULL);
 		plane->layer = layer;
 		layer->plane = plane;
+
+		found_layer = true;
 	}
-	if (i == 0) {
+	if (!found_layer) {
 		liftoff_log(LIFTOFF_DEBUG, "  (No layer has a plane)");
 	}
 

@@ -1,2 +1,4 @@
 version=4
-https://gitlab.freedesktop.org/emersion/libliftoff/-/tags archive/v?@ANY_VERSION@/.*@ARCHIVE_EXT@
+opts="mode=git, gitmode=full, pgpmode=none" \
+https://gitlab.freedesktop.org/emersion/libliftoff.git \
+refs/tags/v@ANY_VERSION@
